@@ -15,6 +15,18 @@
 
 **peek-by-cc-switch** 就是为了解决这些问题而创建的：实时监控日志，过滤噪音，聚合 SSE 碎片，重建完整对话，以可交互的 Web UI 展示。
 
+## 快速开始
+1. cc-switch 已安装并正常使用，且日志文件路径已知（默认为 `~/.cc-switch/logs/cc-switch.log`）
+2. cc-switch
+   1. 设置-代理-本地代理-代理总开关(打开)，代理启用claude(打开),启用日志记录(打开)
+<img width="3008" height="1826" alt="image" src="https://github.com/user-attachments/assets/6d007e63-a550-4937-a8d9-d65395179b87" />
+   3. 设置-高级-日志管理-日志级别(至少 debug(调试))，启用日志(打开)
+<img width="2988" height="1854" alt="image" src="https://github.com/user-attachments/assets/0149b215-e97f-400e-b0e9-14ae082e5048" />
+3. git clone 本项目，进入目录
+4. 运行 `python watch_claude.py`，监听 cc-switch 日志文件，轮询间隔 5s，自动打开浏览器访问 `http://localhost:8765`
+5. 在 Claude Code CLI 中 发起对话，观察 Web UI 实时展示请求和响应
+<img width="3006" height="1642" alt="image" src="https://github.com/user-attachments/assets/a3b36e38-6861-4002-a3d8-5591db5d2af6" />
+
 ## 技术原理 / 数据流向
 
 ```mermaid
@@ -42,15 +54,6 @@ flowchart TD
 
     PEEK -- "SSE 推送 (text/event-stream)" --> UI["浏览器 Web UI<br/>· 会话分组 (Session ID)<br/>· 请求卡片 (实时更新)<br/>· 明暗主题 / 中英切换"]
 ```
-
-## 快速开始
-1. cc-switch 已安装并正常使用，且日志文件路径已知（默认为 `~/.cc-switch/logs/cc-switch.log`）
-2. cc-switch
-   1. 设置-代理-本地代理-代理总开关(打开)，代理启用claude(打开),启用日志记录(打开)
-   2. 设置-高级-日志管理-日志级别(至少 debug(调试))，启用日志(打开)
-3. git clone 本项目，进入目录
-4. 运行 `python3 watch_claude.py`，监听 cc-switch 日志文件，轮询间隔 5s，自动打开浏览器访问 `http://localhost:8765`
-5. 在 Claude Code CLI 中 发起对话，观察 Web UI 实时展示请求和响应
 
 ## 架构设计
 
