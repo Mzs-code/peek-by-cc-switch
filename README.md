@@ -1,13 +1,56 @@
-# CCSwitchWatch — Claude Code 日志监控工具
+# peek-by-cc-switch — Claude Code 日志监控工具
 
-## 需求背景
+## 背景
 
-[CC Switch](https://github.com/farion1231/cc-switch) 是一个 Claude Code 代理管理工具，所有 API 请求和响应都会记录到日志文件 `~/.cc-switch/logs/cc-switch.log`。但这个日志存在两个核心问题：
+使用 Claude Code 时，CLI 只展示部分和最终结果，很多过程是黑盒的：
 
-1. **噪音过多** — 日志中混杂了大量无关内容（TrayIcon 事件、连接池、更新检测等），与 Claude Code 实际交互的关键信息被淹没。
-2. **SSE 碎片化** — Claude API 的响应以 SSE（Server-Sent Events）流式方式记录，一条完整回复被拆成几十到几百行 `content_block_delta` 日志，无法直接阅读。
+- **运行状态不透明** — 不知道 Claude Code 是在思考、调用工具还是卡住了，部分请求在 CLI 中完全没有展示
+- **想学习内部机制** — Claude Code 的系统提示词、PlanMode 等功能组件是如何工作的，只有看到完整的 API 请求/响应才能理解
+- **调试 Skills 困难** — 自定义 Skills 触发后具体发生了什么、完整的 trace 链路是怎样的，缺乏可观测性
 
-**CCSwitchWatch** 就是为了解决这两个问题而创建的：实时监控日志，过滤噪音，聚合 SSE 碎片，重建完整对话，以可交互的 Web UI 展示。
+[CC Switch](https://github.com/farion1231/cc-switch) 作为 Claude Code 的必备工具，同时提供了会话管理,可以提供基本的记录查看。本地代理和日志记录功能结合，所有 API 请求和响应都会记录到 `~/.cc-switch/logs/cc-switch.log`。但这个日志存在两个问题：
+
+1. **噪音过多** — 日志中混杂了大量无关内容（TrayIcon 事件、连接池、更新检测等），关键信息被淹没
+2. **SSE 碎片化** — Claude API 的响应以 SSE 流式方式记录，一条完整回复被拆成几十到几百行 `content_block_delta`，无法直接阅读
+
+**peek-by-cc-switch** 就是为了解决这些问题而创建的：实时监控日志，过滤噪音，聚合 SSE 碎片，重建完整对话，以可交互的 Web UI 展示。
+
+## 技术原理 / 数据流向
+
+```mermaid
+flowchart TD
+    CC["Claude Code (CLI)"]
+    SW["cc-switch (本地代理)"]
+    API["Anthropic API (Claude)"]
+    LOG[("cc-switch.log")]
+
+    CC -- "提问 / 工具调用" --> SW
+    SW -- "代理转发请求" --> API
+    API -- "SSE 流式响应" --> SW
+    SW -- "SSE 流式响应" --> CC
+    SW -- "记录请求体 + SSE 响应" --> LOG
+
+    LOG -- "tail -f 式追踪" --> PEEK
+
+    subgraph PEEK ["peek-by-cc-switch"]
+        direction LR
+        LW["LogWatcher<br/>· 过滤噪音日志<br/>· 解析请求/响应<br/>· Session ID 关联"]
+        AGG["SSEAggregator<br/>· 聚合 SSE 碎片<br/>· 重建完整内容块"]
+        SRV["HTTP + SSE Server<br/>· 广播结构化事件"]
+        LW --> AGG --> SRV
+    end
+
+    PEEK -- "SSE 推送 (text/event-stream)" --> UI["浏览器 Web UI<br/>· 会话分组 (Session ID)<br/>· 请求卡片 (实时更新)<br/>· 明暗主题 / 中英切换"]
+```
+
+## 快速开始
+1. cc-switch 已安装并正常使用，且日志文件路径已知（默认为 `~/.cc-switch/logs/cc-switch.log`）
+2. cc-switch
+   1. 设置-代理-本地代理-代理总开关(打开)，代理启用claude(打开),启用日志记录(打开)
+   2. 设置-高级-日志管理-日志级别(至少 debug(调试))，启用日志(打开)
+3. git clone 本项目，进入目录
+4. 运行 `python3 watch_claude.py`，监听 cc-switch 日志文件，轮询间隔 5s，自动打开浏览器访问 `http://localhost:8765`
+5. 在 Claude Code CLI 中 发起对话，观察 Web UI 实时展示请求和响应
 
 ## 架构设计
 
