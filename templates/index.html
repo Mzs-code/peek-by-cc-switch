@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Claude Code 日志监控</title>
+<style>{{STYLE}}</style>
+</head>
+<body>
+
+<div class="toolbar">
+  <label id="labelLogFile">日志文件</label>
+  <input type="text" id="logFile" value="~/.cc-switch/logs/cc-switch.log" placeholder="日志文件路径">
+  <button onclick="setLogFile()" id="btnSwitchFile">切换</button>
+
+  <label id="labelInterval">间隔(s)</label>
+  <input type="number" id="pollInterval" value="5" min="0.5" max="60" step="0.5">
+  <button onclick="setInterval_()" id="btnSetInterval">设置</button>
+
+  <div class="toolbar-right">
+    <label class="toggle-label">
+      <input type="checkbox" id="fullLogToggle" onchange="toggleFullLog()">
+      <span id="labelFullLog">完整日志</span>
+    </label>
+    <span class="status-dot" id="statusDot"></span>
+    <span class="status-text" id="statusText">连接中...</span>
+    <button onclick="clearCards()" id="clearBtn">清空</button>
+    <button onclick="toggleLang()" id="langBtn">EN</button>
+    <button onclick="toggleTheme()" id="themeBtn">🌙 暗色</button>
+  </div>
+</div>
+
+<div class="layout">
+  <div class="sidebar" id="sidebar">
+    <div class="sidebar-header" id="sidebarHeader">
+      <span id="sidebarTitle">会话</span>
+      <button class="sidebar-toggle" id="sidebarToggle" onclick="toggleSidebar()" title="收起侧边栏">«</button>
+    </div>
+    <div class="sidebar-list" id="sessionList"></div>
+  </div>
+  <button class="sidebar-expand-btn" id="sidebarExpandBtn" onclick="toggleSidebar()" title="展开侧边栏">»</button>
+  <div class="main" id="main">
+    <div class="empty-state" id="emptyState">
+      等待日志事件...<br>
+      <small>确保 CC Switch 代理正在运行，且日志文件路径正确</small>
+    </div>
+  </div>
+</div>
+
+<button class="scroll-top-btn" id="scrollTopBtn" onclick="scrollToTop()" title="回到顶部">↑</button>
+
+<div class="error-panel collapsed" id="errorPanel">
+  <div class="error-panel-header" onclick="toggleErrorPanel()">
+    <span id="errorPanelTitle">错误</span>
+    <span class="error-badge" id="errorBadge">0</span>
+    <button class="error-clear" onclick="event.stopPropagation();clearErrors()" id="errorClearBtn">清空</button>
+  </div>
+  <div class="error-panel-body" id="errorPanelBody"></div>
+</div>
+
+<script>{{SCRIPT}}</script>
+</body>
+</html>
