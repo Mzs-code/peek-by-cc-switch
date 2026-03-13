@@ -22,6 +22,7 @@
 <img width="3008" height="1826" alt="image" src="https://github.com/user-attachments/assets/6d007e63-a550-4937-a8d9-d65395179b87" />
    3. 设置-高级-日志管理-日志级别(至少 debug(调试))，启用日志(打开)
 <img width="2988" height="1854" alt="image" src="https://github.com/user-attachments/assets/0149b215-e97f-400e-b0e9-14ae082e5048" />
+
 3. git clone 本项目，进入目录
 4. 运行 `python watch_claude.py`，监听 cc-switch 日志文件，轮询间隔 5s，自动打开浏览器访问 `http://localhost:8765`
 5. 在 Claude Code CLI 中 发起对话，观察 Web UI 实时展示请求和响应
