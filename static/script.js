@@ -1,7 +1,7 @@
 // ─── i18n ───
 const I18N = {
   zh: {
-    title: 'Claude Code 日志监控',
+    title: 'Claude Code/Codex 日志监控',
     logFile: '日志文件',
     switchFile: '切换',
     intervalLabel: '间隔(s)',
@@ -43,6 +43,7 @@ const I18N = {
     copyBlock: '复制',
     expandContent: '展开',
     collapseContent: '收起',
+    debugOutput: '控制台输出',
     copyJson: '复制JSON',
     jsonCopied: 'JSON 已复制',
     noData: '暂无数据',
@@ -52,7 +53,7 @@ const I18N = {
     sidebarExpand: '展开',
   },
   en: {
-    title: 'Claude Code Log Monitor',
+    title: 'Claude Code/Codex Log Monitor',
     logFile: 'Log File',
     switchFile: 'Switch',
     intervalLabel: 'Interval(s)',
@@ -94,6 +95,7 @@ const I18N = {
     copyBlock: 'Copy',
     expandContent: 'Expand',
     collapseContent: 'Collapse',
+    debugOutput: 'Console Log',
     copyJson: 'Copy JSON',
     jsonCopied: 'JSON copied',
     noData: 'No data yet',
@@ -117,6 +119,7 @@ function applyLang() {
   document.getElementById('clearBtn').textContent = t('clear');
   document.getElementById('langBtn').textContent = t('langBtn');
   document.getElementById('labelFullLog').textContent = t('fullLog');
+  document.getElementById('labelDebugOutput').textContent = t('debugOutput');
   // 主题按钮
   const theme = document.documentElement.getAttribute('data-theme') || 'light';
   document.getElementById('themeBtn').textContent = theme === 'dark' ? t('themeLight') : t('themeDark');
@@ -151,15 +154,36 @@ const cards = {};          // id -> card DOM element
 const cardData = {};       // id -> {model, time, status, sessionId, ...}
 const cardRawBodies = {};  // id -> 原始请求体
 const cardResponseBlocks = {}; // id -> 响应内容块数组
+const pendingCardOps = {}; // id -> [{kind, ...}]，卡片未创建时暂存待渲染操作
 const sessions = {};       // session_id -> {id, model, createdAt, updatedAt, requestCount}
 let activeSessionId = null;
 let eventSource = null;
 const errorLogs = [];     // [{time, reason, rawLog, line}]
 let fullLogEnabled = localStorage.getItem('cc-watch-full-log') === 'true';
+let debugOutputEnabled = localStorage.getItem('cc-watch-debug-output') === 'true';
+const debugEntries = [];
 
 function toggleFullLog() {
   fullLogEnabled = document.getElementById('fullLogToggle').checked;
   localStorage.setItem('cc-watch-full-log', fullLogEnabled);
+}
+
+function toggleDebugOutput() {
+  debugOutputEnabled = document.getElementById('debugOutputToggle').checked;
+  localStorage.setItem('cc-watch-debug-output', debugOutputEnabled);
+}
+
+function debugLog(tag, payload) {
+  if (!debugOutputEnabled) return;
+  const entry = {
+    time: new Date().toISOString(),
+    tag,
+    ...payload,
+  };
+  debugEntries.push(entry);
+  if (debugEntries.length > 500) debugEntries.shift();
+  window.__CC_SWITCH_DEBUG__ = debugEntries;
+  console.log('[cc-watch]', entry);
 }
 
 // ─── 主题 ───
@@ -186,11 +210,13 @@ function connectSSE() {
   eventSource = new EventSource('/events');
 
   eventSource.onopen = () => {
+    debugLog('sse_open', { readyState: eventSource.readyState });
     document.getElementById('statusDot').classList.add('connected');
     document.getElementById('statusText').textContent = t('connected');
   };
 
   eventSource.onerror = () => {
+    debugLog('sse_error', { readyState: eventSource.readyState });
     document.getElementById('statusDot').classList.remove('connected');
     document.getElementById('statusText').textContent = t('disconnected');
   };
@@ -198,6 +224,17 @@ function connectSSE() {
   eventSource.onmessage = (e) => {
     try {
       const evt = JSON.parse(e.data);
+      debugLog('sse_event', {
+        type: evt.type,
+        id: evt.id || null,
+        session_id: evt.session_id || null,
+        role: evt.role || null,
+        block_type: evt.block_type || null,
+        has_card: !!(evt.id && cards[evt.id]),
+        pending_ops: evt.id && pendingCardOps[evt.id] ? pendingCardOps[evt.id].length : 0,
+        response_blocks: evt.id && cardResponseBlocks[evt.id] ? cardResponseBlocks[evt.id].length : 0,
+        evt,
+      });
       handleEvent(evt);
     } catch (err) {
       console.error('Parse error:', err);
@@ -244,6 +281,7 @@ function handleEvent(evt) {
 function handleContentBlock(evt) {
   // 记录响应内容块原始数据
   if (!cardResponseBlocks[evt.id]) cardResponseBlocks[evt.id] = [];
+  const beforeCount = cardResponseBlocks[evt.id].length;
   const rawBlock = { type: evt.block_type };
   if (evt.block_type === 'thinking') {
     rawBlock.thinking = evt.text;
@@ -260,6 +298,14 @@ function handleContentBlock(evt) {
     addBlock(evt.id, 'tool', t('toolCall') + evt.name, inputStr);
   }
   cardResponseBlocks[evt.id].push(rawBlock);
+  debugLog('content_block_stored', {
+    id: evt.id,
+    block_type: evt.block_type,
+    before_count: beforeCount,
+    after_count: cardResponseBlocks[evt.id].length,
+    has_card: !!cards[evt.id],
+    preview: evt.text ? evt.text.slice(0, 80) : (evt.name || null),
+  });
 }
 
 function handleContextMessage(evt) {
@@ -292,7 +338,10 @@ function handleToolsList(evt) {
 
 function addToolsBlock(cardId, tools) {
   const body = document.getElementById('body-' + cardId);
-  if (!body) return;
+  if (!body) {
+    queueCardOp(cardId, { kind: 'tools', tools });
+    return;
+  }
 
   const block = document.createElement('div');
   block.className = 'block block-tools';
@@ -498,12 +547,16 @@ function createCard(evt) {
 
   cards[evt.id] = card;
   cardData[evt.id] = { model: evt.model, time: evt.time, collapsed: false, sessionId: sessionId };
+  flushPendingCardOps(evt.id);
 }
 
 // ─── 内容块添加 ───
 function addBlock(cardId, type, title, content, defaultCollapsed) {
   const body = document.getElementById('body-' + cardId);
-  if (!body) return;
+  if (!body) {
+    queueCardOp(cardId, { kind: 'block', type, title, content, defaultCollapsed });
+    return;
+  }
 
   const block = document.createElement('div');
   block.className = 'block block-' + type;
@@ -632,7 +685,10 @@ function completeCard(evt) {
   }
 
   const body = document.getElementById('body-' + evt.id);
-  if (!body) return;
+  if (!body) {
+    queueCardOp(evt.id, { kind: 'complete', evt });
+    return;
+  }
 
   const statsBar = document.createElement('div');
   statsBar.className = 'stats-bar';
@@ -774,10 +830,42 @@ function clearCards() {
   Object.keys(cardData).forEach(k => delete cardData[k]);
   Object.keys(cardRawBodies).forEach(k => delete cardRawBodies[k]);
   Object.keys(cardResponseBlocks).forEach(k => delete cardResponseBlocks[k]);
+  Object.keys(pendingCardOps).forEach(k => delete pendingCardOps[k]);
   Object.keys(sessions).forEach(k => delete sessions[k]);
   activeSessionId = null;
   document.getElementById('sessionList').innerHTML = '';
   clearErrors();
+}
+
+function queueCardOp(cardId, op) {
+  if (!pendingCardOps[cardId]) pendingCardOps[cardId] = [];
+  pendingCardOps[cardId].push(op);
+  debugLog('queue_card_op', {
+    id: cardId,
+    kind: op.kind,
+    queued: pendingCardOps[cardId].length,
+  });
+}
+
+function flushPendingCardOps(cardId) {
+  const ops = pendingCardOps[cardId];
+  if (!ops || !ops.length) return;
+  debugLog('flush_card_ops', {
+    id: cardId,
+    count: ops.length,
+    kinds: ops.map(op => op.kind),
+  });
+  delete pendingCardOps[cardId];
+
+  for (const op of ops) {
+    if (op.kind === 'block') {
+      addBlock(cardId, op.type, op.title, op.content, op.defaultCollapsed);
+    } else if (op.kind === 'tools') {
+      addToolsBlock(cardId, op.tools);
+    } else if (op.kind === 'complete') {
+      completeCard(op.evt);
+    }
+  }
 }
 
 // ─── 工具函数 ───
@@ -795,6 +883,12 @@ function esc(s) {
 function copyCardAsJson(cardId) {
   const body = cardRawBodies[cardId];
   const blocks = cardResponseBlocks[cardId] || [];
+  debugLog('copy_card_json', {
+    id: cardId,
+    has_body: !!body,
+    response_blocks: blocks.length,
+    response_block_types: blocks.map(block => block.type),
+  });
   if (!body && blocks.length === 0) {
     showToast(t('noData'));
     return;
@@ -899,5 +993,6 @@ function initSidebar() {
 initTheme();
 initSidebar();
 document.getElementById('fullLogToggle').checked = fullLogEnabled;
+document.getElementById('debugOutputToggle').checked = debugOutputEnabled;
 applyLang();
 connectSSE();

@@ -1,14 +1,14 @@
-# peek-by-cc-switch — Claude Code 日志监控工具
+# peek-by-cc-switch — Claude Code / Codex 日志监控工具
 
 ## 背景
 
-使用 Claude Code 时，CLI 只展示部分和最终结果，很多过程是黑盒的：
+使用 Claude Code 或 Codex CLI 时，CLI 只展示部分和最终结果，很多过程是黑盒的：
 
 - **运行状态不透明** — 不知道 Claude Code 是在思考、调用工具还是卡住了，部分请求在 CLI 中完全没有展示
 - **想学习内部机制** — Claude Code 的系统提示词、PlanMode 等功能组件是如何工作的，只有看到完整的 API 请求/响应才能理解
 - **调试 Skills 困难** — 自定义 Skills 触发后具体发生了什么、完整的 trace 链路是怎样的，缺乏可观测性
 
-[CC Switch](https://github.com/farion1231/cc-switch) 作为 Claude Code 的必备工具，同时提供了会话管理,可以提供基本的记录查看。本地代理和日志记录功能结合，所有 API 请求和响应都会记录到 `~/.cc-switch/logs/cc-switch.log`。但这个日志存在两个问题：
+[CC Switch](https://github.com/farion1231/cc-switch) 作为 Claude Code / Codex 的代理工具，同时提供会话管理和基础记录查看。本地代理和日志记录功能结合后，所有 API 请求和响应都会记录到 `~/.cc-switch/logs/cc-switch.log`。但这个日志存在两个问题：
 
 1. **噪音过多** — 日志中混杂了大量无关内容（TrayIcon 事件、连接池、更新检测等），关键信息被淹没
 2. **SSE 碎片化** — Claude API 的响应以 SSE 流式方式记录，一条完整回复被拆成几十到几百行 `content_block_delta`，无法直接阅读
@@ -32,7 +32,7 @@
 
 ```mermaid
 flowchart TD
-    CC["Claude Code (CLI)"]
+    CC["Claude Code / Codex (CLI)"]
     SW["cc-switch (本地代理)"]
     API["Anthropic API (Claude)"]
     LOG[("cc-switch.log")]
@@ -47,8 +47,8 @@ flowchart TD
 
     subgraph PEEK ["peek-by-cc-switch"]
         direction LR
-        LW["LogWatcher<br/>· 过滤噪音日志<br/>· 解析请求/响应<br/>· Session ID 关联"]
-        AGG["SSEAggregator<br/>· 聚合 SSE 碎片<br/>· 重建完整内容块"]
+        LW["LogWatcher<br/>· 过滤噪音日志<br/>· 解析 Claude / Codex 请求体<br/>· Session ID 关联"]
+        AGG["SSEAggregator<br/>· 聚合 Anthropic / OpenAI SSE 碎片<br/>· 重建完整内容块"]
         SRV["HTTP + SSE Server<br/>· 广播结构化事件"]
         LW --> AGG --> SRV
     end
@@ -94,13 +94,207 @@ LogWatcher (后台守护线程)
 └── 日志解析: 正则提取请求 URL、请求体、SSE 事件、完成统计
 
 SSEAggregator (SSE 碎片聚合状态机)
-├── message_start      → 记录 model、初始 usage
-├── content_block_start → 开启新块 (thinking / text / tool_use)
-├── content_block_delta → 累积内容到当前块
-├── content_block_stop  → 推送完整的 content_block 事件
-├── message_delta       → 记录 stop_reason、最终 usage
-└── message_stop        → 完成
+├── Claude / Anthropic:
+│   ├── message_start / content_block_* / message_delta / message_stop
+│   └── 重建 thinking / text / tool_use
+└── Codex / OpenAI Responses:
+    ├── response.output_item.* / response.output_text.* / response.function_call_arguments.*
+    └── 重建 text / tool_use
 ```
+
+## Claude Code / Codex 统一支持说明
+
+### 1. Codex 支持原理
+
+Claude Code 和 Codex 的核心差异不在前端，而在日志协议：
+
+- Claude Code 主要对应 Anthropic Messages API，日志中记录的是 `message_start`、`content_block_start`、`content_block_delta`、`content_block_stop`、`message_delta` 等事件
+- Codex 主要对应 OpenAI Responses API，日志中记录的是 `response.created`、`response.output_item.added`、`response.content_part.added`、`response.output_text.delta`、`response.output_item.done`、`response.function_call_arguments.delta` 等事件
+
+为了兼容两套协议，后端没有把 Codex 单独做一套前端，而是做了“协议解析层 + 统一事件层”：
+
+- `LogWatcher` 负责把原始日志行识别为“新请求 / 请求体 / SSE 事件 / 请求完成”
+- `SSEAggregator` 负责按不同协议重建完整输出块
+- 前端只消费统一后的结构化事件，不关心这次请求来自 Claude Code 还是 Codex
+
+### 2. Codex 请求体解析字段与规则
+
+Codex 请求体和 Claude 请求体的字段结构不同，当前解析规则如下：
+
+- 顶层系统指令：
+  - 优先读取 `instructions`
+  - 同时兼容 `system`
+  - 最终统一广播为 `context_message(role=system)`
+
+- 输入消息：
+  - Claude 读取 `messages`
+  - Codex 读取 `input`
+  - `input` 中只处理带 `role` 的 message 项
+  - `developer` 被映射为 `system-reminder`
+  - `system`、`user`、`assistant` 保持原角色
+
+- 消息内容提取：
+  - 支持字符串内容
+  - 支持数组内容块
+  - 目前会提取 `text`、`input_text`、`output_text`、`refusal`
+  - `tool_use` 会转成可读占位文本
+  - `tool_result` 会展开其中的文本内容
+
+- 最后一条用户消息标记：
+  - Claude: `messages` 中最后一个 `role=user`
+  - Codex: `input` 中最后一个 `role=user`
+  - 会统一附加 `is_last=true`
+
+- 工具定义提取：
+  - 统一读取 `tools`
+  - 工具名缺失时回退到 `type`
+  - `parameters` / `input_schema` / `format` 会统一映射成前端使用的 `input_schema`
+
+- 推理内容处理：
+  - Codex 的 `reasoning.encrypted_content` 当前不会在页面展示
+  - 原因是它本身不可直接读，且和 Claude 的可视化 `thinking` 不是同一种数据
+
+### 3. 架构调整
+
+为了同时支持 Claude Code 和 Codex，架构上的关键调整有两类。
+
+第一类是解析协议从“单协议”升级为“多协议”：
+
+- `watcher/aggregator.py`
+  - 旧逻辑只聚合 Claude 的 `content_block_*`
+  - 新逻辑同时支持 Claude Messages SSE 和 Codex Responses SSE
+
+- `watcher/log_watcher.py`
+  - 旧逻辑主要理解 Claude 风格请求体
+  - 新逻辑同时解析 Claude 的 `messages/system` 和 Codex 的 `instructions/input/tools`
+
+第二类是请求跟踪从“单当前请求”升级为“按 client 维护请求状态”：
+
+- 旧逻辑：
+  - 只有 `current_request_id`
+  - 只有 `current_aggregator`
+  - 默认日志严格串行
+
+- 新逻辑：
+  - 每个 client 独立维护状态
+  - client tag 会统一转小写，避免 `[Codex]` / `[codex]` 断链
+  - 每个 client 有自己的 `request_queue`
+  - 支持同一 client 下连续请求、交错请求，以及跨 session 混合存在
+
+### 4. 数据结构统筹
+
+为了让 Claude Code 和 Codex 都走同一套前后端契约，内部数据结构做了统一。
+
+后端请求状态统一为：
+
+```python
+{
+  "id": request_id,
+  "aggregator": SSEAggregator(...),
+  "response_id": None,
+  "item_ids": set(),
+  "body_received": False,
+  "session_id": "...",
+}
+```
+
+含义：
+
+- `id`
+  - 前端卡片主键，Claude / Codex 共用
+- `aggregator`
+  - 当前请求对应的 SSE 聚合器
+- `response_id`
+  - Codex / OpenAI Responses 的响应 ID，用于把后续流式事件绑定回请求
+- `item_ids`
+  - Codex 输出项 ID 集合，用于把 `response.output_item.*` 和 `response.output_text.*` 继续绑定回原请求
+- `body_received`
+  - 标记该请求体是否已经被消费，防止后续请求体广播错位
+- `session_id`
+  - 该请求所属会话，用于前端分组和完成事件修正
+
+聚合层统一输出为三类内容块：
+
+- `thinking`
+- `text`
+- `tool_use`
+
+其中：
+
+- Claude 可以自然产生 `thinking / text / tool_use`
+- Codex 当前主要产生 `text / tool_use`
+- 前端仍然只理解这三类，不需要为 Codex 单独写新组件
+
+### 5. 前后端事件兼容策略
+
+本项目没有为 Codex 引入新的前端事件协议，而是保持原事件模型不变：
+
+- `request_start`
+- `request_body`
+- `context_message`
+- `tools_list`
+- `content_block`
+- `request_complete`
+
+这样做的目的有两个：
+
+- 前端 UI 不需要区分 Claude Code 和 Codex，只按统一事件渲染
+- 新协议支持主要集中在后端，前端改动尽量小
+
+兼容规则如下：
+
+- Claude / Codex 都会先发 `request_start`
+- 请求体解析成功后统一发 `request_body`
+- 历史上下文统一发 `context_message`
+- 工具定义统一发 `tools_list`
+- SSE 聚合后的正文统一发 `content_block`
+- 完成统计统一发 `request_complete`
+
+前端只认 `id` 和 `session_id`：
+
+- `id` 决定内容落到哪张卡片
+- `session_id` 决定卡片归属到哪个会话分组
+
+另外，前端增加了 `pendingCardOps`：
+
+- 如果 `content_block` / `tools_list` / `request_complete` 先到，但卡片还没创建
+- 这些操作会先缓存
+- 等卡片创建后再统一回放
+
+这样 Claude 和 Codex 都能容忍“事件先到、卡片后到”的时序抖动。
+
+### 6. 当前遗留问题和原因
+
+虽然已经支持 Codex，并修掉了多轮错绑、跨会话串卡等主要问题，但仍有一些遗留风险。
+
+1. 某些 Codex 流式事件仍然缺少足够强的请求标识
+
+- OpenAI Responses 的部分事件没有 `response.id`
+- 有些阶段只能依赖 `item_id`、`request_queue` 和到达顺序推断
+- 这意味着在极端并发、乱序日志、跨 session 高频交错时，仍可能存在误绑定风险
+
+2. `request_complete` 仍然缺少“请求级唯一回填键”
+
+- 当前完成事件优先用 `session=` 匹配请求
+- 这已经解决了跨 session 串卡
+- 但如果同一 session 内存在真正的乱序完成，而日志里又没有可直接映射到前面 request 的稳定唯一键，理论上仍可能把统计信息匹配到同 session 的另一张卡
+
+3. 请求体与首个输出事件之间仍依赖日志顺序
+
+- 当前通过 `body_received`、`response_id`、`item_ids` 来尽量对齐
+- 但如果代理层日志延迟非常异常，例如旧请求的请求体、首个输出、完成行在时间上被严重打散，仍然会增加推断成本
+
+4. Codex 的加密推理内容暂未可视化
+
+- `reasoning.encrypted_content` 不是可直接展示的纯文本
+- 当前策略是忽略这部分，只展示可还原的文本输出和工具调用
+- 这会让 Codex 页面上的“思考过程”可见性弱于 Claude 的 `thinking`
+
+这些遗留问题的根本原因不是前端，而是：
+
+- Claude Messages SSE 和 OpenAI Responses SSE 的日志结构天然不同
+- Codex 的事件链更分散，且部分事件缺少直接 request 级关联键
+- 当前项目又必须在“只读 cc-switch 日志”的前提下做离线推断，而不是直接接管 API 请求上下文
 
 ### 为什么用 SSE 而不是 WebSocket
 
@@ -224,7 +418,7 @@ CCSwitchWatch/
 │   └── script.js            # 所有 JS
 ├── templates/
 │   └── index.html           # HTML 骨架 + {{STYLE}}/{{SCRIPT}} 占位符
-├── test_changes.py          # 单元测试（48 个用例）
+├── test_changes.py          # 单元测试（覆盖 Claude / Codex 解析与归属逻辑）
 ├── testReadme.md            # 测试用例详细说明
 └── README.md
 ```
@@ -235,4 +429,4 @@ CCSwitchWatch/
 python3 test_changes.py
 ```
 
-共 48 个用例，详见 [testReadme.md](testReadme.md)。
+测试覆盖请求体解析、SSE 聚合、跨 client / 跨 session 归属、错误处理等关键路径，详见 [testReadme.md](testReadme.md)。

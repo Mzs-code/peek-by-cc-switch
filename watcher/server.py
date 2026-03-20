@@ -17,20 +17,31 @@ from .config import (
 
 _BASE_DIR = Path(__file__).resolve().parent.parent
 _cached_html = None
+_cached_html_mtime = 0.0
+
+
+def _current_asset_mtime():
+    paths = [
+        _BASE_DIR / "templates" / "index.html",
+        _BASE_DIR / "static" / "style.css",
+        _BASE_DIR / "static" / "script.js",
+    ]
+    return max(path.stat().st_mtime for path in paths)
 
 
 def _build_html():
     """读取模板和静态资源，内联拼装为完整 HTML"""
-    global _cached_html
+    global _cached_html, _cached_html_mtime
     template = (_BASE_DIR / "templates" / "index.html").read_text(encoding="utf-8")
     css = (_BASE_DIR / "static" / "style.css").read_text(encoding="utf-8")
     js = (_BASE_DIR / "static" / "script.js").read_text(encoding="utf-8")
     _cached_html = template.replace("{{STYLE}}", css).replace("{{SCRIPT}}", js)
+    _cached_html_mtime = _current_asset_mtime()
 
 
 def get_html():
     """返回缓存的完整 HTML，首次调用时自动构建"""
-    if _cached_html is None:
+    if _cached_html is None or _current_asset_mtime() > _cached_html_mtime:
         _build_html()
     return _cached_html
 

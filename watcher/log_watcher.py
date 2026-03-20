@@ -1,5 +1,6 @@
 """日志文件监控线程"""
 
+from collections import deque
 import json
 import os
 import re
@@ -26,9 +27,7 @@ class LogWatcher(threading.Thread):
     def __init__(self):
         super().__init__(daemon=True)
         self._stop_event = threading.Event()
-        self.current_aggregator = None
-        self.current_request_id = None
-        self.current_session_id = None
+        self.client_states = {}
         self._line_number = 0
 
     def run(self):
@@ -120,97 +119,65 @@ class LogWatcher(threading.Thread):
 
     def _handle_proxy_line(self, date: str, time_str: str, module: str, message: str, raw_line: str):
         """处理代理相关的日志行"""
+        client, payload = self._split_client_tag(message)
+        state = self._get_client_state(client)
 
         # 0. Session ID 声明 (来自 proxy::handler_context)
-        m = re.match(r"\[[^\]]+\]\s*Session ID:\s*([\w-]+)", message)
+        m = re.match(r"Session ID:\s*([\w-]+)", payload)
         if m:
-            self.current_session_id = m.group(1)
+            state["current_session_id"] = m.group(1)
             return
 
-        # 消息格式: "[Claude] >>> 请求 URL: ..." — 用 \[[^\]]+\] 锚定开头的客户端标签，
-        # 防止 [.*?] 回溯扩展到 JSON 请求体内部的同名模式
-
         # 1. 新请求: >>> 请求 URL:
-        m = re.match(r"\[[^\]]+\]\s*>>> 请求 URL:\s*(\S+)\s*\(model=([^)]+)\)", message)
+        m = re.match(r">>> 请求 URL:\s*(\S+)\s*\(model=([^)]+)\)", payload)
         if m:
-            self.current_request_id = str(uuid.uuid4())
-            self.current_aggregator = SSEAggregator(self.current_request_id)
-            self.current_aggregator.model = m.group(2)
+            request_id = str(uuid.uuid4())
+            aggregator = SSEAggregator(request_id)
+            aggregator.model = m.group(2)
+            request = {
+                "id": request_id,
+                "aggregator": aggregator,
+                "response_id": None,
+                "item_ids": set(),
+                "body_received": False,
+                "session_id": state["current_session_id"],
+            }
+            state["request_queue"].append(request)
+            self._sync_legacy_state(state)
             broadcast_event({
                 "type": "request_start",
-                "id": self.current_request_id,
+                "id": request_id,
                 "time": time_str,
                 "date": date,
                 "model": m.group(2),
                 "url": m.group(1),
-                "session_id": self.current_session_id,
+                "session_id": state["current_session_id"],
             })
             return
 
         # 2. 请求体: >>> 请求体内容
-        m = re.match(r"\[[^\]]+\]\s*>>> 请求体内容\s*\(\d+字节\):\s*(.*)", message, re.DOTALL)
-        if m and self.current_request_id:
+        m = re.match(r">>> 请求体内容\s*\(\d+字节\):\s*(.*)", payload, re.DOTALL)
+        request = self._oldest_request_without_body(state) or self._latest_request(state)
+        if m and request:
             try:
                 body = json.loads(m.group(1))
+                request["body_received"] = True
 
                 # 广播完整请求体
                 broadcast_event({
                     "type": "request_body",
-                    "id": self.current_request_id,
+                    "id": request["id"],
                     "body": body,
                 })
 
-                # a. 提取顶层 system 指令
-                system = body.get("system", "")
-                if isinstance(system, list):
-                    system = "\n".join(
-                        item.get("text", "") for item in system
-                        if isinstance(item, dict) and item.get("type") == "text"
-                    )
-                if system:
-                    broadcast_event({
-                        "type": "context_message",
-                        "id": self.current_request_id,
-                        "role": "system",
-                        "content": system[:10000],
-                    })
+                self._broadcast_request_context(body, request["id"])
 
-                # b. 提取 tools 列表
-                tools = body.get("tools", [])
-                if tools and isinstance(tools, list):
+                tools = self._normalize_tools(body.get("tools", []))
+                if tools:
                     broadcast_event({
                         "type": "tools_list",
-                        "id": self.current_request_id,
+                        "id": request["id"],
                         "tools": tools,
-                    })
-
-                # c. 遍历所有 messages
-                messages = body.get("messages", [])
-                for i, msg in enumerate(messages):
-                    role = msg.get("role", "unknown")
-                    content = msg.get("content", "")
-
-                    # 分离 system-reminder 和普通内容
-                    sys_texts, regular_text = self._split_system_reminders(content)
-
-                    # 广播 system-reminder 为独立系统提醒块
-                    for st in sys_texts:
-                        broadcast_event({
-                            "type": "context_message",
-                            "id": self.current_request_id,
-                            "role": "system-reminder",
-                            "content": st[:10000],
-                        })
-
-                    if not regular_text:
-                        continue
-                    is_last_user = (role == "user" and i == len(messages) - 1)
-                    broadcast_event({
-                        "type": "context_message",
-                        "id": self.current_request_id,
-                        "role": role,
-                        "content": regular_text[:10000],
-                        "is_last": is_last_user,
                     })
             except Exception as exc:
                 broadcast_event({
@@ -223,13 +190,15 @@ class LogWatcher(threading.Thread):
             return
 
         # 3. SSE 事件: <<< SSE 事件:
-        m = re.match(r"\[[^\]]+\]\s*<<< SSE 事件:\s*(.*)", message)
-        if m and self.current_aggregator:
+        m = re.match(r"<<< SSE 事件:\s*(.*)", payload)
+        if m:
             json_str = m.group(1).strip()
             # 日志行尾可能有多余空格
             try:
                 sse_data = json.loads(json_str)
-                self.current_aggregator.feed(sse_data)
+                request = self._resolve_request_for_sse(state, sse_data)
+                if request and request.get("aggregator"):
+                    request["aggregator"].feed(sse_data)
             except json.JSONDecodeError as exc:
                 broadcast_event({
                     "type": "parse_error",
@@ -241,8 +210,8 @@ class LogWatcher(threading.Thread):
             return
 
         # 4. 请求完成: 记录请求日志:
-        m = re.match(r"\[[^\]]+\]\s*记录请求日志:\s*(.*)", message)
-        if m and self.current_request_id:
+        m = re.match(r"记录请求日志:\s*(.*)", payload)
+        if m:
             stats_str = m.group(1)
             stats = {}
             for pair in stats_str.split(", "):
@@ -250,9 +219,13 @@ class LogWatcher(threading.Thread):
                     k, v = pair.split("=", 1)
                     stats[k.strip()] = v.strip()
 
+            request = self._pop_oldest_request(state, stats.get("session", ""))
+            if not request:
+                return
+
             broadcast_event({
                 "type": "request_complete",
-                "id": self.current_request_id,
+                "id": request["id"],
                 "session_id": stats.get("session", ""),
                 "status": int(stats.get("status", 0)),
                 "latency_ms": int(stats.get("latency_ms", 0)),
@@ -263,15 +236,16 @@ class LogWatcher(threading.Thread):
                 "cache_creation": int(stats.get("cache_creation", 0)),
                 "model": stats.get("model", ""),
             })
-            self.current_request_id = None
-            self.current_aggregator = None
             return
 
         # 5. 请求失败: 所有 Provider 均失败
-        if "FWD-002" in message and self.current_request_id:
+        if "FWD-002" in payload:
+            request = self._pop_oldest_request(state)
+            if not request:
+                return
             broadcast_event({
                 "type": "request_complete",
-                "id": self.current_request_id,
+                "id": request["id"],
                 "status": 502,
                 "latency_ms": 0,
                 "first_token_ms": 0,
@@ -281,8 +255,6 @@ class LogWatcher(threading.Thread):
                 "cache_creation": 0,
                 "model": "",
             })
-            self.current_request_id = None
-            self.current_aggregator = None
             return
 
     @staticmethod
@@ -290,6 +262,302 @@ class LogWatcher(threading.Thread):
         """解析 Some(123) 或纯数字"""
         m = re.search(r"(\d+)", s)
         return int(m.group(1)) if m else 0
+
+    def _broadcast_request_context(self, body: dict, request_id: str):
+        system_text = self._extract_system_text(body)
+        if system_text:
+            broadcast_event({
+                "type": "context_message",
+                "id": request_id,
+                "role": "system",
+                "content": system_text[:10000],
+            })
+
+        messages = body.get("messages")
+        if isinstance(messages, list):
+            self._broadcast_claude_messages(request_id, messages)
+
+        input_items = body.get("input")
+        if isinstance(input_items, list):
+            self._broadcast_openai_input_messages(request_id, input_items)
+
+    @staticmethod
+    def _extract_system_text(body: dict) -> str:
+        parts = []
+
+        instructions = body.get("instructions", "")
+        if instructions:
+            parts.append(LogWatcher._extract_message_text(instructions))
+
+        system = body.get("system", "")
+        if isinstance(system, list):
+            system = "\n".join(
+                item.get("text", "") for item in system
+                if isinstance(item, dict) and item.get("type") == "text"
+            )
+        elif not isinstance(system, str):
+            system = LogWatcher._extract_message_text(system)
+
+        if system:
+            parts.append(system)
+
+        return "\n\n".join(part for part in parts if part)
+
+    def _broadcast_claude_messages(self, request_id: str, messages: list):
+        for i, msg in enumerate(messages):
+            if not isinstance(msg, dict):
+                continue
+            role = msg.get("role", "unknown")
+            content = msg.get("content", "")
+
+            sys_texts, regular_text = self._split_system_reminders(content)
+
+            for st in sys_texts:
+                broadcast_event({
+                    "type": "context_message",
+                    "id": request_id,
+                    "role": "system-reminder",
+                    "content": st[:10000],
+                })
+
+            if not regular_text:
+                continue
+            is_last_user = (role == "user" and i == len(messages) - 1)
+            broadcast_event({
+                "type": "context_message",
+                "id": request_id,
+                "role": role,
+                "content": regular_text[:10000],
+                "is_last": is_last_user,
+            })
+
+    def _broadcast_openai_input_messages(self, request_id: str, input_items: list):
+        last_user_index = None
+        for idx, item in enumerate(input_items):
+            if isinstance(item, dict) and item.get("role") == "user":
+                last_user_index = idx
+
+        for idx, item in enumerate(input_items):
+            if not isinstance(item, dict):
+                continue
+
+            role = item.get("role")
+            if not role:
+                continue
+
+            content = self._extract_message_text(item.get("content", ""))
+            if not content:
+                continue
+
+            mapped_role = self._map_openai_role(role)
+            event = {
+                "type": "context_message",
+                "id": request_id,
+                "role": mapped_role,
+                "content": content[:10000],
+            }
+            if mapped_role == "user":
+                event["is_last"] = (idx == last_user_index)
+            broadcast_event(event)
+
+    def _get_client_state(self, client: str):
+        client = (client or "__default__").strip().lower()
+        return self.client_states.setdefault(client, {
+            "current_request_id": None,
+            "current_aggregator": None,
+            "current_session_id": None,
+            "request_queue": deque(),
+            "response_to_request": {},
+            "item_to_request": {},
+            "last_response_id": None,
+        })
+
+    @staticmethod
+    def _split_client_tag(message: str):
+        m = re.match(r"\[([^\]]+)\]\s*(.*)", message, re.DOTALL)
+        if m:
+            return m.group(1).strip().lower(), m.group(2)
+        return "__default__", message
+
+    @staticmethod
+    def _latest_request(state: dict):
+        queue = state.get("request_queue")
+        if queue:
+            return queue[-1]
+
+        legacy_request_id = state.get("current_request_id")
+        legacy_aggregator = state.get("current_aggregator")
+        if legacy_request_id or legacy_aggregator:
+            request_id = legacy_request_id or getattr(legacy_aggregator, "request_id", None) or str(uuid.uuid4())
+            aggregator = legacy_aggregator or SSEAggregator(request_id)
+            request = {
+                "id": request_id,
+                "aggregator": aggregator,
+                "response_id": None,
+                "item_ids": set(),
+                "body_received": False,
+                "session_id": state.get("current_session_id"),
+            }
+            state["request_queue"].append(request)
+            return request
+
+        return None
+
+    @staticmethod
+    def _sync_legacy_state(state: dict):
+        queue = state.get("request_queue")
+        latest = queue[-1] if queue else None
+        if latest:
+            state["current_request_id"] = latest["id"]
+            state["current_aggregator"] = latest["aggregator"]
+        else:
+            state["current_request_id"] = None
+            state["current_aggregator"] = None
+
+    def _pop_oldest_request(self, state: dict, session_id: str = None):
+        queue = state.get("request_queue")
+        if not queue:
+            return None
+        request = None
+        if session_id:
+            for idx, candidate in enumerate(queue):
+                if candidate.get("session_id") == session_id:
+                    request = candidate
+                    del queue[idx]
+                    break
+        if request is None:
+            request = queue.popleft()
+        response_id = request.get("response_id")
+        if response_id:
+            state["response_to_request"].pop(response_id, None)
+            if state.get("last_response_id") == response_id:
+                state["last_response_id"] = None
+        for item_id in request.get("item_ids", set()):
+            state["item_to_request"].pop(item_id, None)
+        self._sync_legacy_state(state)
+        return request
+
+    @staticmethod
+    def _get_sse_item_id(sse_data: dict):
+        item_id = sse_data.get("item_id")
+        if item_id:
+            return item_id
+        item = sse_data.get("item", {})
+        if isinstance(item, dict):
+            return item.get("id")
+        return None
+
+    @staticmethod
+    def _oldest_request_without_body(state: dict):
+        queue = state.get("request_queue") or []
+        for request in queue:
+            if not request.get("body_received"):
+                return request
+        return None
+
+    @staticmethod
+    def _oldest_unbound_request(state: dict):
+        queue = state.get("request_queue") or []
+        for request in queue:
+            if request.get("response_id") is None:
+                return request
+        return None
+
+    @staticmethod
+    def _bind_item_to_request(state: dict, request: dict, item_id: str):
+        if not request or not item_id:
+            return
+        state["item_to_request"][item_id] = request
+        request.setdefault("item_ids", set()).add(item_id)
+
+    def _resolve_request_for_sse(self, state: dict, sse_data: dict):
+        evt_type = sse_data.get("type", "")
+        response = sse_data.get("response", {})
+        response_id = response.get("id")
+        item_id = self._get_sse_item_id(sse_data)
+
+        if item_id:
+            request = state["item_to_request"].get(item_id)
+            if request is not None:
+                if response_id and request.get("response_id") is None:
+                    request["response_id"] = response_id
+                    state["response_to_request"][response_id] = request
+                    state["last_response_id"] = response_id
+                return request
+
+        if response_id:
+            request = state["response_to_request"].get(response_id)
+            if request is None:
+                for candidate in state["request_queue"]:
+                    if candidate.get("response_id") is None:
+                        candidate["response_id"] = response_id
+                        request = candidate
+                        break
+                if request is None:
+                    request = self._latest_request(state)
+                    if request and request.get("response_id") is None:
+                        request["response_id"] = response_id
+                if request is not None:
+                    state["response_to_request"][response_id] = request
+            state["last_response_id"] = response_id
+            if item_id and request is not None:
+                self._bind_item_to_request(state, request, item_id)
+            return request
+
+        if evt_type == "response.output_item.added" and item_id:
+            request = self._oldest_unbound_request(state) or self._latest_request(state)
+            self._bind_item_to_request(state, request, item_id)
+            return request
+
+        if item_id:
+            request = self._oldest_unbound_request(state)
+            if request is not None:
+                self._bind_item_to_request(state, request, item_id)
+                return request
+
+        last_response_id = state.get("last_response_id")
+        if last_response_id:
+            request = state["response_to_request"].get(last_response_id)
+            if request is not None:
+                return request
+
+        if len(state["request_queue"]) == 1:
+            return state["request_queue"][0]
+
+        if evt_type.startswith("response.") and state["request_queue"]:
+            return state["request_queue"][0]
+
+        return self._latest_request(state)
+
+    @staticmethod
+    def _map_openai_role(role: str) -> str:
+        if role == "developer":
+            return "system-reminder"
+        if role in ("system", "user", "assistant"):
+            return role
+        return "assistant"
+
+    @staticmethod
+    def _normalize_tools(tools):
+        if not isinstance(tools, list):
+            return []
+
+        normalized = []
+        for tool in tools:
+            if not isinstance(tool, dict):
+                continue
+            normalized_tool = dict(tool)
+            if "name" not in normalized_tool or not normalized_tool.get("name"):
+                normalized_tool["name"] = tool.get("type", "tool")
+            if "input_schema" not in normalized_tool:
+                if isinstance(tool.get("parameters"), dict):
+                    normalized_tool["input_schema"] = tool["parameters"]
+                elif isinstance(tool.get("input_schema"), dict):
+                    normalized_tool["input_schema"] = tool["input_schema"]
+                elif isinstance(tool.get("format"), dict):
+                    normalized_tool["input_schema"] = tool["format"]
+            normalized.append(normalized_tool)
+        return normalized
 
     @staticmethod
     def _extract_message_text(content) -> str:
@@ -301,8 +569,10 @@ class LogWatcher(threading.Thread):
             for item in content:
                 if isinstance(item, dict):
                     t = item.get("type", "")
-                    if t == "text":
+                    if t in ("text", "input_text", "output_text"):
                         parts.append(item.get("text", ""))
+                    elif t == "refusal":
+                        parts.append(item.get("refusal", ""))
                     elif t == "tool_use":
                         parts.append(f"[Tool Use: {item.get('name', '')}]")
                     elif t == "tool_result":

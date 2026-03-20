@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Claude Code 日志监控</title>
+<title>Claude Code/Codex 日志监控</title>
 <style>{{STYLE}}</style>
 </head>
 <body>
@@ -21,6 +21,10 @@
     <label class="toggle-label">
       <input type="checkbox" id="fullLogToggle" onchange="toggleFullLog()">
       <span id="labelFullLog">完整日志</span>
+    </label>
+    <label class="toggle-label">
+      <input type="checkbox" id="debugOutputToggle" onchange="toggleDebugOutput()">
+      <span id="labelDebugOutput">控制台输出</span>
     </label>
     <span class="status-dot" id="statusDot"></span>
     <span class="status-text" id="statusText">连接中...</span>
