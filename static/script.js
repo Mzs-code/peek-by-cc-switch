@@ -51,6 +51,8 @@ const I18N = {
     toolsCount: '个工具',
     sidebarCollapse: '收起',
     sidebarExpand: '展开',
+    deleteSession: '确定删除该会话？',
+    deleteBtn: '删除',
   },
   en: {
     title: 'Claude Code/Codex Log Monitor',
@@ -103,6 +105,8 @@ const I18N = {
     toolsCount: 'tools',
     sidebarCollapse: 'Collapse',
     sidebarExpand: 'Expand',
+    deleteSession: 'Delete this session?',
+    deleteBtn: 'Delete',
   }
 };
 
@@ -794,10 +798,14 @@ function renderAllSessions() {
     item.className = 'session-item' + (activeSessionId === s.id ? ' active' : '');
     item.id = 'session-' + s.id;
     item.innerHTML = `
-      <div class="session-model">${esc(s.model)}</div>
+      <div class="session-item-header">
+        <div class="session-model">${esc(s.model)}</div>
+        <button class="session-delete-btn" title="${t('deleteBtn')}">&times;</button>
+      </div>
       <div class="session-meta">${t('created')}: ${s.createdAt}</div>
       <div class="session-meta">${t('updated')}: ${s.updatedAt}  ${s.requestCount}${t('reqCount')}</div>
     `;
+    item.querySelector('.session-delete-btn').onclick = (e) => { e.stopPropagation(); deleteSession(s.id); };
     item.onclick = () => switchSession(s.id);
     list.appendChild(item);
   }
@@ -821,6 +829,45 @@ function switchSession(sessionId) {
       card.style.display = '';
     }
   }
+}
+
+function deleteSession(sessionId) {
+  if (!confirm(t('deleteSession'))) return;
+
+  // 删除属于该 session 的所有 card
+  for (const [id, cd] of Object.entries(cardData)) {
+    if (cd.sessionId !== sessionId) continue;
+    const cardEl = cards[id];
+    if (cardEl) cardEl.remove();
+    delete cards[id];
+    delete cardData[id];
+    delete cardRawBodies[id];
+    delete cardResponseBlocks[id];
+    delete pendingCardOps[id];
+  }
+
+  delete sessions[sessionId];
+
+  // 处理 active session
+  if (activeSessionId === sessionId) {
+    const remaining = Object.values(sessions).sort((a, b) => {
+      if (a.updatedAt > b.updatedAt) return -1;
+      if (a.updatedAt < b.updatedAt) return 1;
+      return 0;
+    });
+    if (remaining.length > 0) {
+      switchSession(remaining[0].id);
+    } else {
+      activeSessionId = null;
+      // 显示所有 card（如果还有的话）或显示空状态
+      const main = document.getElementById('main');
+      if (Object.keys(cards).length === 0) {
+        main.innerHTML = '<div class="empty-state" id="emptyState">' + t('emptyTitle') + '<br><small>' + t('emptySub') + '</small></div>';
+      }
+    }
+  }
+
+  renderAllSessions();
 }
 
 function clearCards() {

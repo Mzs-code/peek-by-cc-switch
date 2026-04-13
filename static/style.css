@@ -274,13 +274,49 @@ body {
   background: color-mix(in srgb, var(--accent) 10%, var(--bg-card));
 }
 
+.session-item-header {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
 .session-item .session-model {
+  flex: 1;
+  min-width: 0;
   font-weight: 600;
   color: var(--accent);
   font-size: 13px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.session-delete-btn {
+  flex-shrink: 0;
+  width: 20px;
+  height: 20px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s, background 0.15s, color 0.15s;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.session-item:hover .session-delete-btn,
+.session-item.active .session-delete-btn {
+  opacity: 1;
+}
+
+.session-delete-btn:hover {
+  background: color-mix(in srgb, var(--status-err) 15%, transparent);
+  color: var(--status-err);
 }
 
 .session-item .session-meta {

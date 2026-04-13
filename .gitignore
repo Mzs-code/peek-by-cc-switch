@@ -7,3 +7,5 @@ dist/
 build/
 .env
 *.log
+.trellis/
+.claude/
