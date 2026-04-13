@@ -1,5 +1,12 @@
 # peek-by-cc-switch — Claude Code 日志监控工具
 
+## cc-switch作者推荐
+
+> 开玩笑的哈:) 应该是AI自动处理的issue https://github.com/farion1231/cc-switch/issues/1227
+
+<img width="1886" height="836" alt="image" src="https://github.com/user-attachments/assets/5c3ebb0d-33ee-48ab-974a-4cd79982d8b6" />
+
+
 ## 背景
 
 使用 Claude Code 时，CLI 只展示部分和最终结果，很多过程是黑盒的：
